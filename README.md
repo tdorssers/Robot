@@ -58,5 +58,6 @@ The firmware has been developed in Atmel Studio 7 using GCC C and can be uploade
 
 ## Gallery
 
-
-
+![](media/linefollow.gif) | ![](media/collision.gif)
+---- | ----
+**Line follow mode** | **Collision avoid mode**
