@@ -5,13 +5,14 @@
  * Created:  26-7-2018 18:51:54
  * Author :  Tim Dorssers
  *
- * In line follow mode the robot car uses five TCRT5000 sensors connected to
- * ADC0-ADC4 inputs to detect a dark line on a light surface. ADC conversion is
- * interrupt driven. Weighted average calculation is used to determine the
- * "exact" location of the line. The sensors can be calibrated via UART for
- * better accuracy. Measured values of the light and dark surface are stored in
- * EEPROM. The motors are driven by a PID control. The K values are user
- * configurable via UART as well.
+ * In line-follow mode the robot car uses five TCRT5000 sensors connected to
+ * ADC0-ADC4 inputs to detect a dark line on a light surface or a light line on
+ * a dark surface, selectable by jumper. ADC conversion is interrupt driven. 
+ * The sensors can be calibrated via UART for better accuracy. Measured values
+ * of the light and dark surface are stored in EEPROM. Weighted average
+ * calculation is used to determine the "exact" location of the line. The
+ * motors are driven by a PID control. The K values are scaled integers to
+ * avoid floating point numbers and are user configurable via UART as well.
  * In collision avoidance mode the robot car uses the HC-SR04 module and the
  * SG90 micro servo to "look around". The servo is hardware PWM driven via OC1A
  * output using 16-bit Timer1. The HC-SR04 module is connected to INT0 and uses
@@ -23,8 +24,8 @@
  * distance, the robot reverses until no object is within collision distance
  * anymore. The turning and collision distance are user configurable from the
  * UART. 
- * The DC motors are driven by software PWM implementation using PD4-PD7
- * outputs connected to the L293D motor driver and 8-bit Timer2 interrupt.
+ * The DC motors are driven by a software PWM implementation using 8-bit Timer2
+ * CTC interrupt and PD4-PD7 outputs connected to the L293D motor driver.
  * A mode button, connected to INT1, is used to switch between the different
  * modes; line follow, collision avoid and idle. In idle mode, the robot can be
  * driven "remotely" from the UART as well.
@@ -60,7 +61,11 @@ volatile uint8_t echoDone;
 // Collision avoid
 uint8_t EEMEM nvCollDist = 20; // sets distance at which robot stops and reverses
 uint8_t EEMEM nvTurnDist = 40; // sets distance at which robot veers away from object
-uint8_t collDist, turnDist;
+uint8_t EEMEM nvFwdSpeed = 64, nvRevSpeed = -48;
+uint8_t EEMEM nvTurnSpdH = 64, nvTurnSpdL = -48;
+uint8_t EEMEM nvRetention = 10;
+uint8_t collDist, turnDist, retention;
+int8_t fwdSpeed, revSpeed, turnSpdH, turnSpdL;
 #define DRIVING        0
 #define SWEEP_PENDING  1
 #define SWEEP_PROGRESS 2
@@ -71,25 +76,26 @@ uint8_t collDist, turnDist;
 // IR sensor
 #define ADC_CHANNEL_COUNT 5 // Number of ADC channels we use
 volatile uint8_t adc_values[ADC_CHANNEL_COUNT];
-volatile uint8_t adc_read;
-uint8_t EEMEM nv_adc_min[ADC_CHANNEL_COUNT] = {26, 26, 26, 28, 17};
-uint8_t EEMEM nv_adc_max[ADC_CHANNEL_COUNT] = {141, 136, 142, 160, 101};
+volatile uint8_t adc_read = FALSE;
+uint8_t EEMEM nv_adc_min[ADC_CHANNEL_COUNT] = {45, 45, 45, 45, 45};
+uint8_t EEMEM nv_adc_max[ADC_CHANNEL_COUNT] = {135, 135, 135, 135, 135};
 uint8_t adc_min[ADC_CHANNEL_COUNT], adc_max[ADC_CHANNEL_COUNT];
 
 // PID control K values multiplied by 100
-uint16_t EEMEM nvKp = 500, nvKd = 300, nvKi = 0;
-uint16_t Kp, Kd, Ki;
+uint16_t EEMEM nvKp = 500, nvKd = 50, nvKi = 0;
+int16_t Kp, Kd, Ki;
 
-// Servo PWM, assuming prescaler of 8
+// Servo PWM, using prescaler of 8
 #define TIMER1_TOP   ((F_CPU / 50 / 8) - 1) // 50 Hz (20 ms) PWM period
 #define SERVO_0DEG   ((F_CPU / (1000 / 0.75) / 8) - 1)
 #define SERVO_90DEG  ((F_CPU / (1000 / 1.65) / 8) - 1) // 1.65 ms duty cycle
 #define SERVO_180DEG ((F_CPU / (1000 / 2.55) / 8) - 1)
 #define STEP_18DEG   ((SERVO_180DEG - SERVO_0DEG) / 10)
 
-// Soft PWM, no prescaler, 8-bit
-#define TIMER2_TOP 64  // 16MHz / 256 / 64 ~ 1 KHz PWM period
+// Software PWM, 64 steps, prescaler of 8
+#define TIMER2_TOP ((F_CPU / 64 / 8 / 490) - 1)  //  490 Hz PWM period
 int8_t speedMotor1, speedMotor2;
+uint8_t saveBatt = FALSE;
 
 // Robot running mode
 #define IDLE            0
@@ -242,32 +248,38 @@ inline void init_sonar(void) {
 
 // Initialize soft PWM and L293D pins
 inline void init_motor(void) {
-	// Timer2 enable
-	TCCR2 |= _BV(CS20);
-	TIMSK |= _BV(TOIE2); // enable timer2 overflow interrupt
+	// Timer2 enable in CTC mode using prescaler 8
+	TCCR2 |= _BV(WGM21) | _BV(CS21);
+	TIMSK |= _BV(OCIE2); // Timer2 Output Compare Match Interrupt Enable
+	OCR2 = TIMER2_TOP;
 	// Motor activation pins
-	DDRD |= (_BV(4) | _BV(5) | _BV(6) | _BV(7)); // PD4, PD5, PD6, PD7 output
+	DDRD |= _BV(4) | _BV(5) | _BV(6) | _BV(7); // PD4, PD5, PD6, PD7 output
 	PORTD &= ~(_BV(4) | _BV(5) | _BV(6) | _BV(7)); // PD4, PD5, PD6, PD7 clear
 }
 
 // Timer2 interrupt
-ISR(TIMER2_OVF_vect) {
+ISR(TIMER2_COMP_vect) {
 	static uint8_t countTimer2;
 	static int8_t curSpeed1, curSpeed2;
 	
 	// Start of duty cycle
-	if (countTimer2 == TIMER2_TOP) {
+	if (countTimer2 == 64) {
 		countTimer2 = 0;
-		// Increment or decrement by one until current speed matches set speed
-		// to save battery life
-		if (curSpeed1 < speedMotor1) 
-			curSpeed1++; 
-		else if (curSpeed1 > speedMotor1) 
-			curSpeed1--;
-		if (curSpeed2 < speedMotor2) 
-			curSpeed2++; 
-		else if (curSpeed2 > speedMotor2) 
-			curSpeed2--;
+		if (saveBatt) {
+			// Increment or decrement by one until current speed matches set speed
+			// to save battery life
+			if (curSpeed1 < speedMotor1) 
+				curSpeed1++; 
+			else if (curSpeed1 > speedMotor1) 
+				curSpeed1--;
+			if (curSpeed2 < speedMotor2) 
+				curSpeed2++; 
+			else if (curSpeed2 > speedMotor2) 
+				curSpeed2--;
+		} else {
+			curSpeed1 = speedMotor1;
+			curSpeed2 = speedMotor2;
+		}
 		// Turn on appropriate pins
 		if (curSpeed1 < 0) { // Backward
 			PORTD &= ~(1 << PD4);
@@ -346,9 +358,9 @@ void dump_status(void) {
 // Advanced line follow robot routine
 void line_follow(void) {
 	uint8_t i;
-	int16_t w, v, pos, lpos = 0;
+	int16_t w, v, div, pos, lpos = 0;
 	int16_t der, pid, it = 0;
-	int32_t sum, div;
+	int32_t sum;
 	
 	PORTB |= _BV(PB0);  // Turn IR sensor array on
 	adc_start();
@@ -365,15 +377,18 @@ void line_follow(void) {
 			w -= adc_min[i];              // let w logically go from 0 to B-A
 			w *= 256;                     // w will go from 0 to (B-A)*256
 			w /= adc_max[i] - adc_min[i]; // make w go from 0 to 255
+			if (PINB & _BV(PB4))          // PB4 is high when jumper open
+				w = 256 - w;              // white line on black background
 			v = 64 * (i - 2);
 			sum += (int32_t)w * v;
 			div += w;
 		}
-		pos = sum / div;         // positional error and the proportional term
+		// positional error and the proportional term
+		pos = (div) ? sum / div : 0;
 		der = pos - lpos;        // derivative term
 		lpos = pos;              // save error for next pass
 		it += pos;               // integral term
-		pid = (pos * (int16_t)Kp + it * (int16_t)Ki + der * (int16_t)Kd) / 100;
+		pid = (pos * Kp + it * Ki + der * Kd) / 100;
 		pid = constrain(pid, -128, 128);
 		// dump values
 		dump_adc_values();
@@ -390,6 +405,13 @@ void line_follow(void) {
 			speedMotor1 = 64;
 			speedMotor2 = 64 - pid;
 		}
+		// no line when sum of all weights is zero or max
+		if (div == 0 || div == 1280) {
+			speedMotor1 = 0;
+			speedMotor2 = 0;
+			PORTB ^= _BV(PB3);  // Toggle LED
+		} else
+			PORTB |= _BV(PB3);  // Turn LED on
 		dump_status();
 		_delay_ms(100);
 	}
@@ -401,11 +423,12 @@ void line_follow(void) {
 void collision_avoid(void) {
 	uint16_t distance[11], minDist, avgDistL, avgDistR;
 	uint8_t reverse = FALSE, state = 0, minDistI, divL, divR;
-	uint8_t i = 5, j, minI = 3, maxI = 7, retention = 0;
+	uint8_t i = 5, j, minI = 3, maxI = 7, dataRet = 0;
 	
 	memset(distance, 0, sizeof(distance));
 	OCR1A = SERVO_90DEG;
 	_delay_ms(100);
+	saveBatt = TRUE;
 	while (!uart_available() && robot_mode == COLLISION_AVOID) {
 		// Measure distance for current angle
 		distance[i] = ping_cm();
@@ -439,8 +462,7 @@ void collision_avoid(void) {
 				if (j < 5) {
 					avgDistR += distance[j];
 					divR++;
-				}
-				if (j > 5) {
+				} else if (j > 5) {
 					avgDistL += distance[j];
 					divL++;
 				}
@@ -460,10 +482,10 @@ void collision_avoid(void) {
 			avgDistR /= divR;
 		if (divL)
 			avgDistL /= divL;
-		// Keep data until retention reaches zero
-		if (retention) {
-			retention--;
-			if (!retention)
+		// Keep data until dataRet reaches zero
+		if (dataRet) {
+			dataRet--;
+			if (!dataRet)
 				memset(distance, 0, sizeof(distance));
 		}
 		// Dump values
@@ -481,8 +503,8 @@ void collision_avoid(void) {
 				if (state != REVERSING) {
 					// Object ahead within collision distance; go reverse
 					state = REVERSING;
-					speedMotor1 = -48;
-					speedMotor2 = -48;
+					speedMotor1 = revSpeed;
+					speedMotor2 = revSpeed;
 				}
 			} else if (minDist < turnDist) {
 				// Object within turning distance or within collision distance sideways
@@ -491,12 +513,12 @@ void collision_avoid(void) {
 					state = TURNING;
 					if (avgDistL < avgDistR) {
 						// Turn right
-						speedMotor1 = 0;
-						speedMotor2 = 64;
+						speedMotor1 = turnSpdL;
+						speedMotor2 = turnSpdH;
 					} else {
 						// Turn left
-						speedMotor1 = 64;
-						speedMotor2 = 0;
+						speedMotor1 = turnSpdH;
+						speedMotor2 = turnSpdL;
 					}
 				} else if (state != TURNING) {
 					// Request full range sweep if not already turning
@@ -519,8 +541,8 @@ void collision_avoid(void) {
 				} else {
 					// Drive forward
 					state = DRIVING;
-					speedMotor1 = 64;
-					speedMotor2 = 64;
+					speedMotor1 = fwdSpeed;
+					speedMotor2 = fwdSpeed;
 				}
 			}
 		} else if (state == SWEEP_PROGRESS && (i == minI || i == maxI)) {
@@ -530,7 +552,7 @@ void collision_avoid(void) {
 			minI = 3;
 			maxI = 7;
 			// Set data retention
-			retention = 10;
+			dataRet = retention;
 		} else if (state == SWEEP_PENDING) {
 			// Full range sweep is pending
 			if (i == minI || i == maxI) {
@@ -540,6 +562,7 @@ void collision_avoid(void) {
 		}
 		_delay_ms(100);
 	}
+	saveBatt = FALSE;
 }
 
 // Toggle robot mode
@@ -547,19 +570,19 @@ void toggle_mode(void) {
 	switch (robot_mode) {
 		case LINE_FOLLOW:
 			robot_mode = COLLISION_AVOID;
-			PORTB &= ~_BV(PB0);
+			PORTB &= ~_BV(PB3);
 			PORTB |= _BV(PB2);
 			uart_puts_P("Collision avoid\r\n");
 			break;
 		case COLLISION_AVOID:
 			robot_mode = IDLE;
-			PORTB &= ~(_BV(PB0) | _BV(PB2));
+			PORTB &= ~(_BV(PB3) | _BV(PB2));
 			uart_puts_P("Idle\r\n");
 			break;
 		case IDLE:
 			robot_mode = LINE_FOLLOW;
 			PORTB &= ~_BV(PB2);
-			PORTB |= _BV(PB0);
+			PORTB |= _BV(PB3);
 			uart_puts_P("Line follow\r\n");
 	}
 	// Stop motors
@@ -578,15 +601,21 @@ ISR(INT1_vect, ISR_NOBLOCK) {
 
 // Initialize LEDs and button
 inline void init_etc(void) {
-	MCUCR |= (_BV(ISC10) | _BV(ISC11)); // Raising edge on INT1 generates an interrupt request
-	GICR |= _BV(INT1);                  // External Interrupt Request 1 Enable	
-	DDRB |= (_BV(PB0) | _BV(PB2));      // IR sensor array driver and LED pins as output
+	MCUCR |= _BV(ISC10) | _BV(ISC11);       // Raising edge on INT1 generates an interrupt request
+	GICR |= _BV(INT1);                      // External Interrupt Request 1 Enable	
+	DDRB |= _BV(PB0) | _BV(PB2) | _BV(PB3); // IR sensor array driver and LED pins as output
+	PORTB |= _BV(PB4);                      // Pull up jumper pin
 }
 
 // Read vars from EEPROM
 inline void init_eeprom(void) {
 	collDist = eeprom_read_byte(&nvCollDist);
 	turnDist = eeprom_read_byte(&nvTurnDist);
+	retention = eeprom_read_byte(&nvRetention);
+	fwdSpeed = eeprom_read_byte(&nvFwdSpeed);
+	revSpeed = eeprom_read_byte(&nvRevSpeed);
+	turnSpdH = eeprom_read_byte(&nvTurnSpdH);
+	turnSpdL = eeprom_read_byte(&nvTurnSpdL);
 	eeprom_read_block(&adc_max, &nv_adc_max, sizeof(nv_adc_max));
 	eeprom_read_block(&adc_min, &nv_adc_min, sizeof(nv_adc_min));
 	Kp = eeprom_read_word(&nvKp);
@@ -640,6 +669,11 @@ void constrain_speeds(void) {
 void dump_nv_values(void) {
 	dump_value_P("collDist=", collDist);
 	dump_value_P(", turnDist=", turnDist);
+	dump_value_P(", retention=", retention);
+	dump_value_P("\r\nfwdSpeed=", fwdSpeed);
+	dump_value_P(", revSpeed=", revSpeed);
+	dump_value_P(", turnSpeed=", turnSpdH);
+	dump_value_P(", ", turnSpdL);
 	dump_value_P("\r\nKp=", Kp);
 	dump_value_P(", Ki=", Ki);
 	dump_value_P(", Kd=", Kd);
@@ -709,12 +743,12 @@ void handle_uart(void) {
 			break;
 		case 'm': // calibrate light surface
 			adc_once();
-			memcpy((void*)&adc_max, (void*)&adc_values, sizeof(adc_max));
+			memcpy((void *)&adc_max, (void *)&adc_values, sizeof(adc_max));
 			eeprom_write_block(&adc_max, &nv_adc_max, sizeof(adc_max));
 			break;
 		case 'n': // calibrate dark line
 			adc_once();
-			memcpy((void*)&adc_min, (void*)&adc_values, sizeof(adc_min));
+			memcpy((void *)&adc_min, (void *)&adc_values, sizeof(adc_min));
 			eeprom_write_block(&adc_min, &nv_adc_min, sizeof(adc_min));
 			break;
 		case 'p': // enter new Kp value
@@ -732,8 +766,28 @@ void handle_uart(void) {
 		case 'v': // show stored values
 			dump_nv_values();
 			break;
+		case 'f':
+			fwdSpeed = input_val_P("fwdSpeed=", fwdSpeed);
+			eeprom_write_byte(&nvFwdSpeed, fwdSpeed);
+			break;
+		case 'r':
+			revSpeed = input_val_P("revSpeed=", revSpeed);
+			eeprom_write_byte(&nvRevSpeed, revSpeed);
+			break;
+		case 'h':
+			turnSpdH = input_val_P("turnSpdH=", turnSpdH);
+			eeprom_write_byte(&nvTurnSpdH, turnSpdH);
+			break;
+		case 'l':
+			turnSpdL = input_val_P("turnSpdL=", turnSpdL);
+			eeprom_write_byte(&nvTurnSpdL, turnSpdL);
+			break;
+		case 'e':
+			retention = input_val_P("retention=", retention);
+			eeprom_write_byte(&nvRetention, retention);
+			break;
 		default: // show valid input characters
-			uart_puts_P("ASDW,space,Toggle_mode,pinG,adc_Once,Colldist,tUrndist,Max,miN,kP,Kd,kI,dump_nV\r\n");
+			uart_puts_P("ASDW,space,Toggle_mode,pinG,adc_Once,Colldist,tUrndist,adc_Max,adc_miN,kP,Kd,kI,dump_nV,Fwdspeed,Revspeed,turnspdH,turnspdL,rEtention\r\n");
 	}
 }
 
