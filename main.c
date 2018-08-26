@@ -7,12 +7,14 @@
  *
  * In line-follow mode the robot car uses five TCRT5000 sensors connected to
  * ADC0-ADC4 inputs to detect a dark line on a light surface or a light line on
- * a dark surface, selectable by jumper. ADC conversion is interrupt driven. 
- * The sensors can be calibrated via UART for better accuracy. Measured values
- * of the light and dark surface are stored in EEPROM. Weighted average
- * calculation is used to determine the "exact" location of the line. The
- * motors are driven by a PID control. The K values are scaled integers to
- * avoid floating point numbers and are user configurable via UART as well.
+ * a dark surface, selected by the set button. ADC conversion is interrupt
+ * driven. The sensors can be calibrated when the robot car is in idle mode for
+ * better accuracy by holding the set button and moving the robot car over the
+ * dark and light surface. Measured values of the light and dark surface are
+ * stored in EEPROM. Weighted average calculation is used to determine the
+ * "exact" location of the line. The motors are driven by a PID control. The K
+ * values are scaled integers to avoid floating point numbers and are user
+ * configurable via UART.
  * In collision avoidance mode the robot car uses the HC-SR04 module and the
  * SG90 micro servo to "look around". The servo is hardware PWM driven via OC1A
  * output using 16-bit Timer1. The HC-SR04 module is connected to INT0 and uses
@@ -22,13 +24,13 @@
  * from 0 to 180 degrees and chooses the angle with the maximum average clear
  * distance to turn to. When an object is detected ahead within the collision
  * distance, the robot reverses until no object is within collision distance
- * anymore. The turning and collision distance are user configurable from the
- * UART. 
+ * anymore. The turning and collision distance as well as motor speeds are user
+ * configurable from the UART.
  * The DC motors are driven by a software PWM implementation using 8-bit Timer2
  * CTC interrupt and PD4-PD7 outputs connected to the L293D motor driver.
- * A mode button, connected to INT1, is used to switch between the different
- * modes; line follow, collision avoid and idle. In idle mode, the robot can be
- * driven "remotely" from the UART as well.
+ * The mode button is used to switch between the different modes; line follow,
+ * collision avoid and idle. In idle mode, the robot can be driven "remotely"
+ * from the UART as well.
  */ 
 
 #ifndef F_CPU
@@ -54,46 +56,51 @@ char buffer[10];
 // Ultrasonic ranging sensor
 #define MAX_DISTANCE  300      // sets maximum usable sensor measuring distance
 #define CM_ECHO_TIME  (F_CPU / 17013)    // Speed of sound in cm divided by two
-#define MAX_ECHO_TIME (CM_ECHO_TIME * MAX_DISTANCE) // Maximum sensor distance
+#define MAX_ECHO_TIME (CM_ECHO_TIME * MAX_DISTANCE)  // Maximum sensor distance
 uint32_t countTimer0;
 volatile uint8_t echoDone;
 
 // Collision avoid
-uint8_t EEMEM nvCollDist = 20; // sets distance at which robot stops and reverses
-uint8_t EEMEM nvTurnDist = 40; // sets distance at which robot veers away from object
-uint8_t EEMEM nvFwdSpeed = 64, nvRevSpeed = -48;
-uint8_t EEMEM nvTurnSpdH = 64, nvTurnSpdL = -48;
-uint8_t EEMEM nvRetention = 10;
-uint8_t collDist, turnDist, retention;
-int8_t fwdSpeed, revSpeed, turnSpdH, turnSpdL;
 #define DRIVING        0
 #define SWEEP_PENDING  1
 #define SWEEP_PROGRESS 2
 #define SWEEP_FINISHED 3
 #define TURNING        4
 #define REVERSING      5
+#define STOPPED        6
+uint8_t EEMEM nvCollDist = 20;   // sets distance at which robot stops and reverses
+uint8_t EEMEM nvTurnDist = 40;   // sets distance at which robot veers away from object
+uint8_t EEMEM nvFwdSpeed = 64, nvRevSpeed = -48;
+uint8_t EEMEM nvTurnSpdH = 64, nvTurnSpdL = -48;
+uint8_t EEMEM nvRetention = 10;  // 1000 ms
+uint8_t EEMEM nvTimeOut = 50;    // 5000 ms
+uint8_t collDist, turnDist, retention, timeOut;
+int8_t fwdSpeed, revSpeed, turnSpdH, turnSpdL;
 
 // IR sensor
-#define ADC_CHANNEL_COUNT 5 // Number of ADC channels we use
+#define ADC_CHANNEL_COUNT    5   // Number of ADC channels we use
+#define ADC_CALIBRATE_CYCLES 50  // 5000 ms
 volatile uint8_t adc_values[ADC_CHANNEL_COUNT];
 volatile uint8_t adc_read = FALSE;
 uint8_t EEMEM nv_adc_min[ADC_CHANNEL_COUNT] = {45, 45, 45, 45, 45};
 uint8_t EEMEM nv_adc_max[ADC_CHANNEL_COUNT] = {135, 135, 135, 135, 135};
 uint8_t adc_min[ADC_CHANNEL_COUNT], adc_max[ADC_CHANNEL_COUNT];
+uint8_t EEMEM nv_inverse = FALSE;
+uint8_t inverse, requestCalibrate = FALSE;
 
 // PID control K values multiplied by 100
 uint16_t EEMEM nvKp = 500, nvKd = 50, nvKi = 0;
 int16_t Kp, Kd, Ki;
 
 // Servo PWM, using prescaler of 8
-#define TIMER1_TOP   ((F_CPU / 50 / 8) - 1) // 50 Hz (20 ms) PWM period
+#define TIMER1_TOP   ((F_CPU / 50 / 8) - 1)      // 50 Hz (20 ms) PWM period
 #define SERVO_0DEG   ((F_CPU / (1000 / 0.75) / 8) - 1)
 #define SERVO_90DEG  ((F_CPU / (1000 / 1.65) / 8) - 1) // 1.65 ms duty cycle
 #define SERVO_180DEG ((F_CPU / (1000 / 2.55) / 8) - 1)
 #define STEP_18DEG   ((SERVO_180DEG - SERVO_0DEG) / 10)
 
 // Software PWM, 64 steps, prescaler of 8
-#define TIMER2_TOP ((F_CPU / 64 / 8 / 490) - 1)  //  490 Hz PWM period
+#define TIMER2_TOP ((F_CPU / 64 / 8 / 488) - 1)  // 488 Hz PWM period
 int8_t speedMotor1, speedMotor2;
 uint8_t saveBatt = FALSE;
 
@@ -103,10 +110,17 @@ uint8_t saveBatt = FALSE;
 #define COLLISION_AVOID 2
 uint8_t robot_mode = IDLE;
 
+// Push buttons
+#define DEBOUNCE  5     // 100 ms
+#define LONG_PUSH 50    // 1000 ms
+uint8_t modeButton = 0, setButton = 0;
+
 // Function prototypes
+void adc_calibrate(void);
 void adc_once(void);
 void collision_avoid(void);
 void constrain_speeds(void);
+void dump_adc_min_max(void);
 void dump_adc_values(void);
 void dump_array_p(const char *progmem_s, uint8_t *p, size_t t);
 void dump_newline(void);
@@ -124,7 +138,10 @@ inline void init_sonar(void);
 int16_t input_val_p(const char *progmem_s, int16_t val);
 void line_follow(void);
 uint16_t ping_cm(void);
+void status_led(void);
+void toggle_inverse(void);
 void toggle_mode(void);
+void waitWhile(void);
 
 //Function macros
 #define min(a,b) ((a)<(b)?(a):(b))
@@ -132,6 +149,8 @@ void toggle_mode(void);
 #define constrain(amt,low,high) ((amt)<(low)?(low):((amt)>(high)?(high):(amt)))
 #define adc_stop() ADCSRA &= ~(_BV(ADEN) | _BV(ADSC)) // Disable ADC, stop conversion
 #define adc_start() ADCSRA |= (_BV(ADEN) | _BV(ADSC)) // Enable ADC, start conversion
+#define ir_stop() PORTD &= ~_BV(PD3);  // Turn IR sensor array off
+#define ir_start() PORTD |= _BV(PD3);  // Turn IR sensor array on
 #define dump_array_P(__s, __p, __t) dump_array_p(PSTR(__s), __p, __t)
 #define dump_value_P(__s, __v) dump_value_p(PSTR(__s), __v)
 #define input_val_P(__s, __v) input_val_p(PSTR(__s), __v)
@@ -202,7 +221,7 @@ uint16_t ping_cm(void) {
 	_delay_us(10);
 	PORTC &= ~_BV(PC5);
 	// Previous ping hasn't finished, abort.
-	if(PIND & _BV(PIND2))
+	if (bit_is_set(PIND, PIND2))
 		return lastPing;
 	// loop till echo pin goes low
 	while(!echoDone);
@@ -214,7 +233,7 @@ uint16_t ping_cm(void) {
 	return lastPing;
 }
 
-// Timer0 interrupt
+// Timer0 interrupt fires F_CPU / 256 times per second for echo pulse time measurement
 ISR(TIMER0_OVF_vect) {
 	countTimer0 += 255;
 	if (countTimer0 > MAX_ECHO_TIME) {
@@ -225,9 +244,9 @@ ISR(TIMER0_OVF_vect) {
 	}
 }
 
-// Echo pin interrupt
+// HC-SR04 echo pin interrupt
 ISR(INT0_vect){
-	if(PIND & _BV(PIND2)) {
+	if (bit_is_set(PIND, PD2)) {
 		// rising edge
 		TCCR0 = _BV(CS00);    // Timer0 Clock Select No Prescaling
 	} else {
@@ -252,12 +271,11 @@ inline void init_motor(void) {
 	TCCR2 |= _BV(WGM21) | _BV(CS21);
 	TIMSK |= _BV(OCIE2); // Timer2 Output Compare Match Interrupt Enable
 	OCR2 = TIMER2_TOP;
-	// Motor activation pins
-	DDRD |= _BV(4) | _BV(5) | _BV(6) | _BV(7); // PD4, PD5, PD6, PD7 output
-	PORTD &= ~(_BV(4) | _BV(5) | _BV(6) | _BV(7)); // PD4, PD5, PD6, PD7 clear
+	// Motor activation pins as output
+	DDRD |= _BV(PD4) | _BV(PD5) | _BV(PD6) | _BV(PD7);
 }
 
-// Timer2 interrupt
+// Timer2 interrupt implements software PWM for DC motor control
 ISR(TIMER2_COMP_vect) {
 	static uint8_t countTimer2;
 	static int8_t curSpeed1, curSpeed2;
@@ -333,6 +351,7 @@ void dump_newline(void) {
 	uart_puts_P("\r\n");
 }
 
+// Put comma space chars to UART
 void dump_separator(void) {
 	uart_puts_P(", ");
 }
@@ -355,6 +374,15 @@ void dump_status(void) {
 	dump_newline();
 }
 
+// Wait a moment as long as robot_mode doesn't change
+void waitWhile(void) {
+	uint8_t i = 100, rm;
+	
+	rm = robot_mode;
+	while(i-- && robot_mode == rm)
+		_delay_ms(10);
+}
+
 // Advanced line follow robot routine
 void line_follow(void) {
 	uint8_t i;
@@ -362,8 +390,10 @@ void line_follow(void) {
 	int16_t der, pid, it = 0;
 	int32_t sum;
 	
-	PORTB |= _BV(PB0);  // Turn IR sensor array on
+	ir_start();
 	adc_start();
+	PORTB |= _BV(PB0);  // Turn LED on
+	waitWhile();
 	while (!uart_available() && robot_mode == LINE_FOLLOW) {
 		adc_read = TRUE; // Request ADC value update
 		while(adc_read); // Wait until we get fresh values
@@ -377,9 +407,9 @@ void line_follow(void) {
 			w -= adc_min[i];              // let w logically go from 0 to B-A
 			w *= 256;                     // w will go from 0 to (B-A)*256
 			w /= adc_max[i] - adc_min[i]; // make w go from 0 to 255
-			if (PINB & _BV(PB4))          // PB4 is high when jumper open
+			if (inverse)
 				w = 256 - w;              // white line on black background
-			v = 64 * (i - 2);
+			v = 64 * (i - 2);             // 64 per channel, v goes from -128 to 128
 			sum += (int32_t)w * v;
 			div += w;
 		}
@@ -409,36 +439,38 @@ void line_follow(void) {
 		if (div == 0 || div == 1280) {
 			speedMotor1 = 0;
 			speedMotor2 = 0;
-			PORTB ^= _BV(PB3);  // Toggle LED
+			PORTB ^= _BV(PB0);  // Toggle LED
 		} else
-			PORTB |= _BV(PB3);  // Turn LED on
+			PORTB |= _BV(PB0);  // Turn LED on
 		dump_status();
 		_delay_ms(100);
 	}
 	adc_stop();
-	PORTB &= ~_BV(PB0); // Turn IR sensor array off
+	ir_stop();
 }
 
 // Collision avoidance robot routine
 void collision_avoid(void) {
 	uint16_t distance[11], minDist, avgDistL, avgDistR;
 	uint8_t reverse = FALSE, state = 0, minDistI, divL, divR;
-	uint8_t i = 5, j, minI = 3, maxI = 7, dataRet = 0;
+	uint8_t i = 5, j, minI = 3, maxI = 7, dataRet = 0, manCnt = 0;
 	
 	memset(distance, 0, sizeof(distance));
-	OCR1A = SERVO_90DEG;
-	_delay_ms(100);
 	saveBatt = TRUE;
+	PORTB |= _BV(PB2);  // Turn LED on
+	waitWhile();
 	while (!uart_available() && robot_mode == COLLISION_AVOID) {
 		// Measure distance for current angle
 		distance[i] = ping_cm();
 		// Go back and forth in steps of 18 degrees
-		if (reverse) {
-			OCR1A -= STEP_18DEG;
-			i--;
-		} else {
-			OCR1A += STEP_18DEG;
-			i++;
+		if (state != STOPPED) {
+			if (reverse) {
+				OCR1A -= STEP_18DEG;
+				i--;
+			} else {
+				OCR1A += STEP_18DEG;
+				i++;
+			}
 		}
 		// Center servo
 		if (i == 5)
@@ -497,17 +529,20 @@ void collision_avoid(void) {
 		dump_separator();
 		dump_status();
 		// State machine
-		if (state != SWEEP_PENDING && state != SWEEP_PROGRESS) {
+		if (state != SWEEP_PENDING && state != SWEEP_PROGRESS && state != STOPPED) {
 			// No sweep pending or in progress
 			if (minDist < collDist && minDistI >= 3 && minDistI <= 7) {
+				// Object ahead within collision distance
+				manCnt++;
 				if (state != REVERSING) {
-					// Object ahead within collision distance; go reverse
+					// Go reverse
 					state = REVERSING;
 					speedMotor1 = revSpeed;
 					speedMotor2 = revSpeed;
 				}
 			} else if (minDist < turnDist) {
 				// Object within turning distance or within collision distance sideways
+				manCnt++;
 				if (state == SWEEP_FINISHED) {
 					// Full range sweep has finished; start turning
 					state = TURNING;
@@ -531,6 +566,7 @@ void collision_avoid(void) {
 				}
 			} else {
 				// No object within turn and collision distance
+				manCnt = 0;
 				if (state == REVERSING) {
 					// Stop reversing and request full range sweep
 					state = SWEEP_PENDING;
@@ -559,6 +595,14 @@ void collision_avoid(void) {
 				// Start sweep
 				state = SWEEP_PROGRESS;
 			}
+		} else if (state == STOPPED)
+			PORTB ^= _BV(PB2);  // Toggle LED
+		// Check for maneuver timeout
+		if (manCnt > timeOut) {
+			state = STOPPED;
+			speedMotor1 = 0;
+			speedMotor2 = 0;
+			i = 5;
 		}
 		_delay_ms(100);
 	}
@@ -570,41 +614,68 @@ void toggle_mode(void) {
 	switch (robot_mode) {
 		case LINE_FOLLOW:
 			robot_mode = COLLISION_AVOID;
-			PORTB &= ~_BV(PB3);
-			PORTB |= _BV(PB2);
 			uart_puts_P("Collision avoid\r\n");
 			break;
 		case COLLISION_AVOID:
 			robot_mode = IDLE;
-			PORTB &= ~(_BV(PB3) | _BV(PB2));
 			uart_puts_P("Idle\r\n");
 			break;
 		case IDLE:
 			robot_mode = LINE_FOLLOW;
-			PORTB &= ~_BV(PB2);
-			PORTB |= _BV(PB3);
 			uart_puts_P("Line follow\r\n");
 	}
-	// Stop motors
-	speedMotor1 = 0;
-	speedMotor2 = 0;
-	// Servo to neutral
-	OCR1A = SERVO_90DEG;
 }
 
-// Mode button interrupt
-ISR(INT1_vect, ISR_NOBLOCK) {
-	_delay_ms(100);
-	toggle_mode();
-	_delay_ms(1000);
-}
-
-// Initialize LEDs and button
+// Initialize LEDs and buttons
 inline void init_etc(void) {
-	MCUCR |= _BV(ISC10) | _BV(ISC11);       // Raising edge on INT1 generates an interrupt request
-	GICR |= _BV(INT1);                      // External Interrupt Request 1 Enable	
-	DDRB |= _BV(PB0) | _BV(PB2) | _BV(PB3); // IR sensor array driver and LED pins as output
-	PORTB |= _BV(PB4);                      // Pull up jumper pin
+	DDRD |= _BV(PD3);                       // IR sensor array driver as output
+	DDRB |= _BV(PB0) | _BV(PB2) | _BV(PB4); // LED pins as output
+	PORTB |= _BV(PB3) | _BV(PB5);           // Pull up button pins
+	TIMSK |= _BV(TOIE1);                    // Timer1 overflow interrupt enable
+}
+
+// LED shows inverse status
+void status_led(void) {
+	if (inverse)
+		PORTB |= _BV(PB4);  // Turn on LED
+	else
+		PORTB &= ~_BV(PB4); // Turn off LED
+}
+
+// Toggle inverse mode
+void toggle_inverse(void) {
+	inverse ^= TRUE;
+	eeprom_write_byte(&nv_inverse, inverse);
+	status_led();
+}
+
+// Timer1 interrupt implements button scanning and debouncing
+ISR(TIMER1_OVF_vect) {
+	// Check if mode button is pushed
+	if (bit_is_clear(PINB, PB3))
+		modeButton++;
+	else {
+		if (modeButton >= DEBOUNCE)
+			// Toggle robot mode
+			toggle_mode();
+		modeButton = 0;
+	}
+	// Check if set button is pushed
+	if (bit_is_clear(PINB, PB5))
+		setButton++;
+	else {
+		if (setButton >= DEBOUNCE) {
+			if (setButton >= LONG_PUSH) {
+				// Request auto calibrate
+				if (robot_mode == IDLE)
+					requestCalibrate = TRUE;
+			} else {
+				// Toggle inverse mode
+				toggle_inverse();
+			}
+		}
+		setButton = 0;
+	}
 }
 
 // Read vars from EEPROM
@@ -616,8 +687,10 @@ inline void init_eeprom(void) {
 	revSpeed = eeprom_read_byte(&nvRevSpeed);
 	turnSpdH = eeprom_read_byte(&nvTurnSpdH);
 	turnSpdL = eeprom_read_byte(&nvTurnSpdL);
+	timeOut = eeprom_read_byte(&nvTimeOut);
 	eeprom_read_block(&adc_max, &nv_adc_max, sizeof(nv_adc_max));
 	eeprom_read_block(&adc_min, &nv_adc_min, sizeof(nv_adc_min));
+	inverse = eeprom_read_byte(&nv_inverse);
 	Kp = eeprom_read_word(&nvKp);
 	Kd = eeprom_read_word(&nvKd);
 	Ki = eeprom_read_word(&nvKi);
@@ -649,14 +722,47 @@ int16_t input_val_p(const char *progmem_s, int16_t val) {
 
 // Start single ADC conversion to refresh ADC values array
 void adc_once(void) {
-	PORTB |= _BV(PB0);  // Turn IR sensor array on
+	ir_start();
 	adc_start();
 	adc_read = TRUE;    // Request ADC value update
 	while(adc_read);    // Wait until we get fresh values
 	adc_stop();
-	PORTB &= ~_BV(PB0); // Turn IR sensor array off
-	dump_adc_values();  // Dump values to UART
+	ir_stop();
+}
+
+// Dump adc_min and adc_max arrays to UART
+void dump_adc_min_max(void) {
+	dump_array_P("adc_min=", adc_min, sizeof(adc_min));
+	dump_array_P("\r\nadc_max=", adc_max, sizeof(adc_max));
 	dump_newline();
+}
+
+// Perform auto calibration
+void adc_calibrate(void) {
+	uint8_t i, j;
+	
+	requestCalibrate = FALSE;
+	// Set max to lowest possible value and set min to highest possible value
+	memset(adc_max, 0, sizeof(adc_max));
+	memset(adc_min, 180, sizeof(adc_min));
+	// Repeatedly get ADC values
+	for (i = 0; i < ADC_CALIBRATE_CYCLES; i++) {
+		PORTB ^= _BV(PB4);   // Toggle LED
+		adc_once();          // Refresh ADC values
+		for (j = 0; j < ADC_CHANNEL_COUNT; j++) {
+			// Find min and max values for each channel
+			adc_min[j] = min(adc_min[j], adc_values[j]);
+			adc_max[j] = max(adc_max[j], adc_values[j]);
+		}
+		_delay_ms(100);
+	}
+	// Store new values in EEPROM
+	eeprom_write_block(&adc_max, &nv_adc_max, sizeof(adc_max));
+	eeprom_write_block(&adc_min, &nv_adc_min, sizeof(adc_min));
+	// Dump new values to UART
+	dump_adc_min_max();
+	// Restore LED state
+	status_led();
 }
 
 // Constrain motor speeds within -64 and 64
@@ -670,6 +776,7 @@ void dump_nv_values(void) {
 	dump_value_P("collDist=", collDist);
 	dump_value_P(", turnDist=", turnDist);
 	dump_value_P(", retention=", retention);
+	dump_value_P(", timeOut=", timeOut);
 	dump_value_P("\r\nfwdSpeed=", fwdSpeed);
 	dump_value_P(", revSpeed=", revSpeed);
 	dump_value_P(", turnSpeed=", turnSpdH);
@@ -677,9 +784,9 @@ void dump_nv_values(void) {
 	dump_value_P("\r\nKp=", Kp);
 	dump_value_P(", Ki=", Ki);
 	dump_value_P(", Kd=", Kd);
-	dump_array_P("\r\nadc_min=", adc_min, sizeof(adc_min));
-	dump_array_P("\r\nadc_max=", adc_max, sizeof(adc_max));
+	dump_value_P(", inverse=", inverse);
 	dump_newline();
+	dump_adc_min_max();
 }
 
 // Handle UART input
@@ -715,13 +822,15 @@ void handle_uart(void) {
 			dump_status();
 			break;
 		case '4': // servo to right
-			OCR1A = SERVO_0DEG;
+			if (OCR1A < SERVO_180DEG)
+				OCR1A += STEP_18DEG;
 			break;
 		case '5': // servo to neutral
 			OCR1A = SERVO_90DEG;
 			break;
 		case '6': // servo to left
-			OCR1A = SERVO_180DEG;
+			if (OCR1A > SERVO_0DEG)
+				OCR1A -= STEP_18DEG;
 			break;
 		case 'g': // single sonar ping
 			dump_value_P("ping=", ping_cm());
@@ -729,6 +838,8 @@ void handle_uart(void) {
 			break;
 		case 'o': // single adc conversion
 			adc_once();
+			dump_adc_values();
+			dump_newline();
 			break;
 		case 't': // toggle robot mode
 			toggle_mode();
@@ -740,16 +851,6 @@ void handle_uart(void) {
 		case 'u': // enter new turning distance
 			turnDist = input_val_P("turnDist=", turnDist);
 			eeprom_write_byte(&nvTurnDist, turnDist);
-			break;
-		case 'm': // calibrate light surface
-			adc_once();
-			memcpy((void *)&adc_max, (void *)&adc_values, sizeof(adc_max));
-			eeprom_write_block(&adc_max, &nv_adc_max, sizeof(adc_max));
-			break;
-		case 'n': // calibrate dark line
-			adc_once();
-			memcpy((void *)&adc_min, (void *)&adc_values, sizeof(adc_min));
-			eeprom_write_block(&adc_min, &nv_adc_min, sizeof(adc_min));
 			break;
 		case 'p': // enter new Kp value
 			Kp = input_val_P("Kp=", Kp);
@@ -766,33 +867,43 @@ void handle_uart(void) {
 		case 'v': // show stored values
 			dump_nv_values();
 			break;
-		case 'f':
+		case 'f': // enter new fwdSpeed value
 			fwdSpeed = input_val_P("fwdSpeed=", fwdSpeed);
 			eeprom_write_byte(&nvFwdSpeed, fwdSpeed);
 			break;
-		case 'r':
+		case 'r': // enter new revSpeed value
 			revSpeed = input_val_P("revSpeed=", revSpeed);
 			eeprom_write_byte(&nvRevSpeed, revSpeed);
 			break;
-		case 'h':
+		case 'h': // enter new turnSpdH value
 			turnSpdH = input_val_P("turnSpdH=", turnSpdH);
 			eeprom_write_byte(&nvTurnSpdH, turnSpdH);
 			break;
-		case 'l':
+		case 'l': // enter new turnSpdL value
 			turnSpdL = input_val_P("turnSpdL=", turnSpdL);
 			eeprom_write_byte(&nvTurnSpdL, turnSpdL);
 			break;
-		case 'e':
+		case 'e': // enter new retention value
 			retention = input_val_P("retention=", retention);
 			eeprom_write_byte(&nvRetention, retention);
 			break;
+		case 'n': // toggle inverse mode
+			toggle_inverse();
+			break;
+		case 'b': // run auto calibration
+			adc_calibrate();
+			break;
+		case 'm': // enter new timeOut value
+			timeOut = input_val_P("timeOut=", timeOut);
+			eeprom_write_byte(&nvTimeOut, timeOut);
+			break;
 		default: // show valid input characters
-			uart_puts_P("ASDW,space,Toggle_mode,pinG,adc_Once,Colldist,tUrndist,adc_Max,adc_miN,kP,Kd,kI,dump_nV,Fwdspeed,Revspeed,turnspdH,turnspdL,rEtention\r\n");
+			uart_puts_P("WASD,spacebar,Toggle_mode,adc_caliBrate,pinG,adc_Once,kP,Kd,kI,iNverse,Colldist,tUrndist,Fwdspeed,Revspeed,turnspdH,turnspdL,rEtention,tiMeout,dump_nV,456\r\n");
 	}
 }
 
-// Main loop
 int main(void) {
+	// Setup
 	uart_init(UART_BAUD_SELECT(9600, F_CPU));
 	init_adc();
 	init_motor();
@@ -800,11 +911,21 @@ int main(void) {
 	init_sonar();
 	init_etc();	
 	init_eeprom();
+	status_led();  // Inverse mode status LED
 	sei();         // enable all interrupts
 	uart_puts_P("\ecCompiled "__DATE__" "__TIME__" with AVR-GCC "__VERSION__" and AVR Libc "__AVR_LIBC_VERSION_STRING__"\r\n");
 	dump_nv_values();
 	uart_puts_P("Idle\r\n");
+	// Main loop
 	while (1) {
+		// Stop motors
+		speedMotor1 = 0;
+		speedMotor2 = 0;
+		// Servo to neutral
+		OCR1A = SERVO_90DEG;
+		// Turn off LEDs
+		PORTB &= ~(_BV(PB0) | _BV(PB2));
+		// Run routines
 		switch (robot_mode) {
 			case LINE_FOLLOW: 
 				line_follow();
@@ -812,7 +933,11 @@ int main(void) {
 			case COLLISION_AVOID:
 				collision_avoid();
 		}
+		// Handle characters in UART ring buffer if any
 		if (uart_available()) 
 			handle_uart();
+		// Run auto calibration if requested
+		if (requestCalibrate)
+			adc_calibrate();
 	}
 }
