@@ -60,7 +60,7 @@ The robot is built using a ZK-4WD DIY car kit that uses geared DC motors. Two ci
 ## Firmware
 The firmware has been developed in Atmel Studio 7 using GCC C and can be uploaded to the ATmega8 using the ISP connector and an ISP programmer such as [USBasp tool](http://www.fischl.de/usbasp/) using [avrdude](http://www.nongnu.org/avrdude/):
 
-`avrdude -p m8 -c usbasp -U flash:w:Robot.hex:i -U eeprom:w:Robot.eep:i -U hfuse:w:0xC9:m -U lfuse:w:0xFF:m`
+`avrdude -p m8 -c usbasp -U flash:w:Robot.hex:i -U eeprom:w:Robot.eep:i -U hfuse:w:0xD9:m -U lfuse:w:0xAE:m`
 
 ## Gallery
 
